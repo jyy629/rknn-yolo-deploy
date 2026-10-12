@@ -1,0 +1,23 @@
+# ---- build artifacts ----
+*.o
+*.obj
+build/
+
+# ---- prebuilt executables ----
+yolo8_1.1.0/run
+yolo8_1.1.0/running/set_cam_1.1
+yolov5.1.0.3/yolo_demo
+
+# ---- vendored / compiled shared libraries ----
+*.so
+*.so.*
+yolov5.1.0.3/system_so/
+yolov5.1.0.3/yolo_so/
+yolo8_1.1.0/running/lib/
+
+# ---- editor / OS noise ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
