@@ -1,23 +1,45 @@
 # RKNN 端侧实时目标检测部署 Demo（YOLOv8 / YOLOv5）
 
-面向 **Rockchip RK3568** 的端侧多路实时目标检测部署工程。完整跑通
+面向 **Rockchip RK3568** 的端侧多路实时目标检测部署工程。跑通
 **RTSP 拉流 → 硬件解码 → RGA 缩放/转色 → RKNN NPU 推理 → 后处理 → HTTP 推流** 全链路，
-并附带模型裁剪工具与量化精度/性能分析。
+从硬解、连续内存、环形缓存、SIMD 后处理到量化误差分析一整套都自己实现，
+并附带模型裁剪工具与逐层量化精度/性能分析。
 
-> 语言：C++17（板端推理管线）+ Bash（交叉编译 / 部署）+ Python（ONNX 裁剪工具）
+> C++17（板端推理管线）· Bash（交叉编译 / 部署）· Python（ONNX 裁剪工具）
 
 ---
 
-## 特性
+## 技术要点
 
-- **多路并发**：1–5 路 RTSP 摄像头，每路独立线程与独立 HTTP 端口（8080 起递增）
-- **全硬件流水线**：GStreamer 拉流 → Rockchip MPP 硬解（H.265 / H.264）→ RGA 缩放转色 → RKNN NPU 推理
-- **连续内存 + 零拷贝设计**：DMA-Heap(CMA) 分配物理连续内存，通过 `rknn_set_io_mem` 直接绑定，避免额外拷贝
-- **HTTP MJPEG 推流**：`multipart/x-mixed-replace`，浏览器直接打开 `http://<ip>:<port>` 即可看实时画面与检测框
-- **YOLOv8 定制后处理**：针对 RKNN 量化特性深度裁剪的「双输出」模型（plan A / plan B），DFL 解码按需 CPU/NPU 分工
-- **YOLOv5 后处理**：三输出 + anchor 解码，`pthread` 多线程并行 + NEON 加速 + NMS
-- **USE 设备观测**：对 RGA / VPU / NPU 统计占用率（U / S / E），支持 internal / external 两种取数模式
-- **一键构建与部署**：交叉编译脚本 + 板端自动配网启动脚本 + PC 端 adb 部署脚本
+**全硬件流水线，全程不落 CPU 拷贝。**
+RTSP 拉流 → **MPP 硬件解码（H.265 / H.264）** → **RGA 缩放与色彩转换（NV12→RGB）** → **RKNN NPU 推理**，
+帧数据走 **DMA-Heap(CMA) 物理连续内存** 并通过 `rknn_set_io_mem` 直接绑定为模型 I/O 张量，
+避免中间帧在 CPU 与 NPU 之间来回搬运，把延迟压在内存带宽这一环之下。
+
+**有界环形缓存 + 丢帧反压，端到端不堆积。**
+自研模板化环形队列 `circular_list<T, N>`，流水线每一级之间用独立环形缓存解耦；
+队列写满时**自动丢弃最旧帧并触发回调释放硬解帧**（`mpp_frame_deinit`），
+消费者侧用条件变量唤醒、无帧时非阻塞让出 CPU——高负载下主动丢帧保证延迟稳定、内存不涨。
+
+**ARM NEON 向量化热点后处理。**
+后处理最吃 CPU 的两处都用 NEON 重写：
+16 路 int8 并行做置信度阈值筛选（`vcgeq_s8` 出位掩码 → `__builtin_ctzll` 只枚举命中项，跳过绝大多数无效格点）；
+NMS 的 IoU 用 `float32x4` 四路并行计算，配合位图（bitmask）批量置位剔除。
+
+**反量化查表（LUT），后处理零浮点乘除。**
+预构建 256 项**反量化表 / sigmoid 表 / exp 表**，运行时把 `(int8 - zp) * scale`、`sigmoid`、`exp` 全部换成一次查表，
+把后处理里的浮点乘法链直接抹掉。
+
+**多线程多输出头并行解码。**
+YOLOv5 的三个输出头各起一个 worker 线程，用条件变量做令牌式派发（`dispatch_and_wait`）与主线程同步，
+三个头的解码真正并行，随后统一 NMS。
+
+**量化精度可诊断、可定位。**
+内置逐层**量化精度分析**（simulator/runtime 的 cos 相似度与欧氏误差）与逐层**性能分析**（Cycles / MacUsage / 耗时），
+并支持导出逐类命中统计、反量化直方图等诊断报告，用来定位是「哪一层把精度搞崩的」。
+
+**原生中文标签渲染。**
+自带点阵中文字库，直接往帧缓冲（RGB）上绘制中文类别名，不依赖 freetype 等任何重依赖。
 
 ---
 
@@ -32,11 +54,11 @@
  │ GStreamer  │   │ MPP 硬解码   │   │ 缩放 + 转色  │   │  YOLOv8/5    │   │ MJPEG 推流 │
  │ rtspsrc    │   │ H265 / H264  │   │ NV12→RGB     │   │ NPU + 后处理 │   │ :8080+     │
  └────────────┘   └──────────────┘   └──────────────┘   └──────────────┘   └────────────┘
-        └──────────────────── PSQ_strategic 管线调度（每级独立线程 + 缓存队列）────────────────────┘
-                                        PSQ_observer (USE 监控)
+        └──── 每级之间 = 独立线程 + 有界环形缓存（circular_list）────┘
+                                              PSQ_observer（USE 设备利用率监控）
 ```
 
-每路摄像头对应一条独立队列，管线各级以线程 + 条件变量解耦，形成生产者—消费者流水。
+每一级都是「独立线程 + 环形缓存」的生产者—消费者，摄像头路数在运行时配置，各级解耦、可独立观测。
 
 ---
 
@@ -50,19 +72,19 @@ demo/
 │   ├── vpu_0.0.1.hh
 │   ├── rga_0.0.0.hh        # RGA 缩放 / 格式转换
 │   ├── rga_v4l2_0.0.0.hh
-│   ├── v4l2_0.0.0.hh       # V4L2 摄像头采集（本地 USB/MIPI 摄像头场景）
+│   ├── v4l2_0.0.0.hh       # V4L2 本地摄像头采集
 │   ├── rkn_0.0.0.hh        # RKNN 上下文 / 张量 / 内存封装
 │   ├── yolov8_0.0.0.hh     # YOLOv8 后处理
 │   ├── yolov5_0.0.0.hh     # YOLOv5 后处理
 │   ├── http_0.0.0.hh       # HTTP MJPEG 服务
 │   ├── observer.hh         # USE 利用率观测
-│   ├── strategy.hh         # 管线调度（核心）
+│   ├── strategy.hh         # 管线调度 + 环形缓存（核心）
 │   ├── creat_cma.h         # DMA-Heap 连续内存分配
 │   └── sync_0.0.0.h
 ├── any_source/             # 上述模块的实现
-│   ├── yolov8_0.0.0.cc
-│   ├── yolov5_0.0.0.cc
-│   └── http_0.0.0.cc
+│   ├── yolov8_0.0.0.cc     # 后处理（NEON 筛选 / LUT 反量化 / DFL / NMS）
+│   ├── yolov5_0.0.0.cc     # 后处理（多线程多头部 / NEON NMS / 中文标签）
+│   └── http_0.0.0.cc       # MJPEG 推流
 ├── yolo8_1.1.0/            # ★ 主程序：多路 RTSP 管线
 │   ├── run.cc              # 入口：解析 set.cfg → 组装并启动管线
 │   ├── set.cfg             # 运行配置
@@ -83,18 +105,43 @@ demo/
 
 ---
 
-## 关键实现
+## 关键技术实现
 
-- **管线调度 `PSQ_strategic`**：为拉流、解码、缩放、推理、推流各建线程，按 `video_id` 分流，
-  使用 `std::mutex` + `condition_variable` 与环形缓存区解耦，支持优雅退出（`end_*` 依次收敛）。
-- **连续内存 `creat_cma.h`**：自定义 `dma-heap` 结构，从 `/dev/dma_heap/reserved` 分配的物理连续内存，
-  喂给 RGA / RKNN 时无需再做一次内存搬运。
-- **RKNN 零拷贝**：`rknn_create_mem` + `rknn_set_io_mem` 绑定 I/O 张量内存，
-  `rknn_mem_sync` 在 CPU 与 NPU 之间同步。
-- **YOLOv8 后处理（`yolov8_0.0.0.*`）**：见下文。
-- **YOLOv5 后处理（`yolov5_0.0.0.*`）**：反量化表法，多线程切分输出张量做并行解码，NEON 加速，最后统一 NMS。
-- **USE 观测（`observer.hh` + `use_check.sh`）**：统计 RGA/VPU/NPU 的
-  `U`（占用率）、`S`（状态）、`E`（错误/异常计数）并渲染成终端表格；`internal` 模式软件计时，`external` 模式从内核节点读取。
+### 环形缓存 `circular_list<T, N>`（`strategy.hh`）
+
+- 固定 N 槽的有界队列（拉流/解码 3 槽，RGA/推理/推流 5 槽），每级流水独立一份。
+- **写满即丢最旧帧**，并通过 `abandon_function` 回调收回资源——硬解路径在这里 `mpp_frame_deinit`，防止 MPP 缓冲泄漏。
+- 提供 **阻塞消费** `get_new()`（条件变量等待）与 **非阻塞消费** `try_get_new()`（无帧立即返回、按积压量取舍），
+  供下游在高负载下主动让出或丢帧。
+
+### 硬件解码与 RGA 缩放
+
+- **MPP 硬解**：H.265 / H.264 走 RK 硬件解码器，输出 NV12 的 `MppFrame`（含 `buf_fd` / stride / 物理地址）。
+- **RGA 转色 + 缩放**：`cvtcolor`（NV12→RGB）+ `resize`（到模型输入尺寸）在 RGA 硬件上完成，
+  通过 `mpp_buffer_inc_ref` / `mpp_buffer_put` 精确管理硬解缓冲生命周期。
+
+### RKNN 推理（`rkn_0.0.0`）
+
+- `rknn_create_mem` 分配 I/O 张量内存，`rknn_set_io_mem` 绑定，
+  `rknn_mem_sync` 在 CPU 与 NPU 间同步，输入输出零拷贝。
+
+### YOLOv8 后处理（`yolov8_0.0.0.cc`）
+
+- **NEON 阈值筛选**：以 int8 直接比较置信度（`vcgeq_s8`），产出位掩码后用 `ctz` 逐位枚举命中格点，跳过所有未命中项。
+- **LUT 反量化**：`dequantiz_table` / `dequantiz_sigmoid_table` / `dequantiz_exp` 三张三查表；
+  plane A 的 DFL softmax 直接用 exp 表算（并已验证 box logits 范围 < 20，可直接查表、无需减最大值，兼顾数值稳定）。
+- **按类 NMS**：先按「类别 + 置信度」排序并切出每类区间，再在类内做 IoU 抑制，避免跨类比较。
+
+### YOLOv5 后处理（`yolov5_0.0.0.cc`）
+
+- **三头并行解码**：三个输出头各一个 worker 线程，条件变量令牌式同步（`dispatch_and_wait`），每帧并行解码后归并。
+- **NEON NMS**：检测框先转 **SoA** 布局，NMS 用 `float32x4` 四路并行算交并比，结果写回 **位图**（`uint32_t` 掩码）批量剔除。
+- **自绘中文标签**：`font_cn.h` 点阵字库直接往 RGB 帧缓冲写中文类别名。
+
+### USE 观测（`observer.hh` + `use_check.sh`）
+
+- 分别统计 RGA / VPU / NPU 的 **U（占用率）、S（状态）、E（异常计数）**，终端渲染成表格。
+- `internal` 模式由软件计时采点，`external` 模式从内核节点读取；可在启动时开关。
 
 ---
 
@@ -102,16 +149,15 @@ demo/
 
 ### 1. 交叉编译（PC 上）
 
-`build.sh` 使用 aarch64 交叉工具链把 `run.cc` + `any_source/{http,yolov8}*.cc` 编成板端可执行文件，
-并自动生成 `running/` 目录（含可执行、依赖 `.so`、`set.cfg`、模型、启动脚本）。
+`build.sh` 用 aarch64 交叉工具链把 `run.cc` + `any_source/{http,yolov8}*.cc` 编成板端可执行文件，
+并自动生成 `running/`（可执行、依赖 `.so`、`set.cfg`、模型、启动脚本）。
 
 ```bash
 ./build.sh <模型路径>
 # 例: ./build.sh ./yolov8s_normal_800448_plan_A.rknn
 ```
 
-> ⚠️ `build.sh` 顶部的 `GXX / SYSROOT / PROJECT_ROOT` 是写死的本机路径，
-> 换环境时请改成你自己的交叉工具链与工程根目录。
+> ⚠️ `build.sh` 顶部的 `GXX / SYSROOT / PROJECT_ROOT` 是写死的本机路径，换环境时请改成你自己的交叉工具链与工程根目录。
 
 ### 2. 板端直接运行
 
@@ -119,18 +165,18 @@ demo/
 cd running
 ./run_devices.sh
 ```
-`run_devices.sh` 会：扫描所有以太网口 → 按摄像头网段自动配对网口并配置 IP → 逐路 ping 校验连通性 → 启动程序。
+`run_devices.sh`：扫描所有以太网口 → 按摄像头网段自动配对网口并配置 IP → 逐路 ping 校验连通性 → 启动程序。
 
 ### 3. PC 端远程部署运行（需要 adb）
 
 ```bash
 ./run_pc.sh
 ```
-流程：`adb push running/ → 开发板` → 在板端自动配网 → `adb forward` 逐路端口转发 → 远程启动。
+流程：`adb push running/ → 开发板` → 板端自动配网 → `adb forward` 逐路端口转发 → 远程启动。
 
 ### 4. 查看画面
 
-浏览器打开 → `http://<板子IP或localhost>:8080`（第 2 路为 8081，依次递增）。
+浏览器打开 `http://<板子IP或localhost>:8080`（第 2 路 8081，依次递增）。
 
 ---
 
@@ -159,16 +205,12 @@ RKNN 量化时，YOLOv8 原模型末端把 `box` 与 `sort` 两个分支 `Concat
 共用同一套量化参数会导致 **sort 分支精度严重坍缩**。因此本工程使用**裁剪掉 Concat 的双输出模型**：
 
 - **plan A**：去掉 `Concat` 且拔掉 `box` 分支的 DFL 解码，把 DFL(softmax) 放回 **CPU** 软处理。
-  - 好处：CPU 侧可先按 sort 分支筛选候选，再做 DFL，计算量大幅减小；
-  - 且 box 裁剪到 logits 量程（约 ±16），比原 scale（~3.x）分辨率更细，量化精度更好。
+  - CPU 侧可先按 sort 分支筛选候选再做 DFL，计算量大幅减小；
+  - box 裁剪到 logits 量程（约 ±16），比原 scale（~3.x）分辨率更细，量化精度更好。
 - **plan B**：仅去掉 `Concat`，保留 `box` 分支的 DFL 在模型内。
 
-后处理统一走「反量化表」法：预先按 `zero_point / scale` 构建 256 项查表
-（`dequantiz_table` / `dequantiz_sigmoid_table` / `dequantiz_exp`），
-运行时直接查表还原浮点，避免逐元素乘法。
-
-裁剪工具见 `fix_a_auto.py`：自动识别 grid / 类别数，剪掉整条 DFL 链，输出
-`dfl_logits(1,64,N)` 与 `scores(1,nc,N)` 双输出，并内置数值验证（参考解码 vs 原模型，误差断言 < 1e-3）。
+后处理统一走「反量化表」法（见上）。裁剪工具见 `fix_a_auto.py`：自动识别 grid / 类别数，剪掉整条 DFL 链，
+输出 `dfl_logits(1,64,N)` 与 `scores(1,nc,N)` 双输出，并内置数值验证（参考解码 vs 原模型，误差断言 < 1e-3）。
 
 ```bash
 python fix_a_auto.py <in.onnx> [out.onnx]
@@ -180,8 +222,8 @@ python fix_a_auto.py <in.onnx> [out.onnx]
 
 - `plane_A.txt` / `plane_B.txt`：RKNN Toolkit 的**逐层量化精度分析**，
   给出每层 simulator / runtime 的 `cos`（余弦相似度，越接近 1 越好）与 `euc`（欧氏误差）。
-- `evel_planA`：RKNN Toolkit 的**性能/内存分析**，包含模型内存占用
-  （Weight / Internal Tensor / Total）、各频率设定，以及逐层 `OpType / Target / 耗时(us) / MacUsage` 表。
+- `evel_planA`：RKNN Toolkit 的**性能/内存分析**，含模型内存占用（Weight / Internal Tensor / Total）、各频率设定，
+  以及逐层 `OpType / Target / 耗时(us) / MacUsage` 表。
 
 ---
 
