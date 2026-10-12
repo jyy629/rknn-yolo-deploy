@@ -159,8 +159,8 @@ demo/
 
 ### USE 观测（`observer.hh` + `use_check.sh`）
 
-- 分别统计 RGA / VPU / NPU 的 **U（占用率）、S（状态）、E（异常计数）**，终端渲染成表格。
-- `internal` 模式由软件计时采点，`external` 模式从内核节点读取；可在启动时开关。
+- 分别统计 RGA / VPU / NPU 的 **U（利用率）、S（流水线缓存积压）、E（错误计数）**，终端渲染成表格。
+- `internal` 模式由软件计时采点，`external` 模式从内核节点读取（`/sys/kernel/debug/rknpu/load`、`/sys/kernel/debug/rkrga/load`、`/proc/mpp_service/load`）；可在启动时开关。
 
 ---
 
